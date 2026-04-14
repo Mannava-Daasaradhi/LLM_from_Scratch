@@ -1,4 +1,3 @@
-# P2 — LLM from Scratch
 
 > **Domain:** AI/ML · **Year:** 1 · **Months:** 2–3 · **Daily Time Budget:** 2 hrs  
 > **Legal Status:** ✅ Safe — no legal restrictions  
@@ -1127,6 +1126,4 @@ At 2 hrs/day this is a 6-day focused sprint. Do it in one week — context switc
 
 ---
 
-*Previous: [P1b — MiniFlow v2.0](../P1a_MiniFlow_MLOps_v0.1/README_2.md) · Next: [P3 — Tensor-Exploit Adversarial ML](../P3_Tensor_Exploit/README.md)*
-#   L L M _ f r o m _ S c r a t c h  
- 
+
