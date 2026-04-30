@@ -114,10 +114,12 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             PAD_TOKEN_ID = 0  # Assuming 0 based on our BPE tokenizer
+            # In forward(), change the loss line to:
             loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size), 
-                targets.view(-1), 
-                ignore_index=PAD_TOKEN_ID
+                logits.view(-1, self.config.vocab_size),
+                targets.view(-1),
+                ignore_index=PAD_TOKEN_ID,
+                label_smoothing=0.1   # ADD THIS — prevents memorization
             )
             
         return logits, loss

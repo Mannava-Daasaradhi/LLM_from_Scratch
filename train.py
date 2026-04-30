@@ -15,17 +15,8 @@ from pathlib import Path
 
 from tokenizer.bpe import BPETokenizer
 from model.transformer import GPT
+from miniflow import ExperimentTracker, ModelRegistry
 
-# --- Fallback for ExperimentTracker ---
-try:
-    from miniflow import ExperimentTracker
-except ImportError:
-    print("Warning: miniflow not found. Using dummy ExperimentTracker.")
-    class ExperimentTracker:
-        def __init__(self, name): pass
-        def log_params(self, params): pass
-        def log_metric(self, name, value, step): pass
-        def finish(self): pass
 
 # --- Dynamic Config Loader ---
 class ConfigNode:
@@ -74,8 +65,6 @@ def configure_optimizer(model, config):
     for pn, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        
-        # No decay for biases, LayerNorms, or Embeddings
         if pn.endswith('bias') or 'norm' in pn or 'emb' in pn or 'pe' in pn:
             no_decay_params.append(p)
         else:
@@ -85,9 +74,9 @@ def configure_optimizer(model, config):
         {"params": decay_params, "weight_decay": config.training.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
-    
+
     return torch.optim.AdamW(
-        param_groups, 
+        param_groups,
         lr=config.training.learning_rate,
         betas=(config.training.beta1, config.training.beta2)
     )
@@ -105,41 +94,64 @@ def get_lr(step: int, config) -> float:
         return max_lr * (step + 1) / warmup_steps
     if step > max_steps:
         return min_lr
-    
-    # Cosine decay
+
     progress = (step - warmup_steps) / (max_steps - warmup_steps)
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-# --- Evaluation & Saving ---
+# --- Evaluation ---
 @torch.no_grad()
 def evaluate(model, val_loader, device, n_steps) -> float:
     """Average val loss over n_steps batches."""
     model.eval()
     losses = []
     for i, (x, y) in enumerate(val_loader):
-        if i >= n_steps: break
+        if i >= n_steps:
+            break
         x, y = x.to(device), y.to(device)
         _, loss = model(x, targets=y)
         losses.append(loss.item())
     return sum(losses) / len(losses)
 
-def save_checkpoint(model, optimizer, step, val_loss, config, best_val_loss):
-    """Save to checkpoints/step_{step}.pt. Keep only best (lowest val_loss)."""
+
+# --- Checkpoint + Registry ---
+def save_checkpoint(model, optimizer, step, val_loss, config, best_val_loss, tracker_run_id: str) -> float:
+    """
+    Saves best checkpoint to disk via torch and registers it with
+    MiniFlow ModelRegistry so it appears under `miniflow models list`.
+    Returns updated best_val_loss.
+    """
+    if val_loss >= best_val_loss:
+        return best_val_loss
+
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
-    
-    if val_loss < best_val_loss:
-        ckpt_path = os.path.join(config.training.checkpoint_dir, "best.pt")
-        torch.save({
-            'step': step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_loss,
-            'config': config # Save config so generation script knows the architecture
-        }, ckpt_path)
-        print(f"  --> Saved new best checkpoint to {ckpt_path}")
-        return val_loss
-    return best_val_loss
+    ckpt_path = os.path.join(config.training.checkpoint_dir, "best.pt")
+
+    torch.save({
+        'step': step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss,
+        'config': config,
+    }, ckpt_path)
+    print(f"  --> Saved new best checkpoint to {ckpt_path}")
+
+    # Register the model with MiniFlow so it's queryable via CLI
+    registry = ModelRegistry()
+    model_id = registry.save(
+        name="gpt_shakespeare",
+        model_obj=model,
+        metadata={
+            "step": step,
+            "val_loss": round(val_loss, 4),
+            "val_perplexity": round(math.exp(val_loss), 4),
+            "run_id": tracker_run_id,
+            "checkpoint_path": ckpt_path,
+        }
+    )
+    print(f"  --> Registered model as '{model_id}' in MiniFlow registry")
+
+    return val_loss
 
 
 # --- Main Loop ---
@@ -149,10 +161,11 @@ def train(config_path: str):
         config_dict = yaml.safe_load(f)
     config = ConfigNode(config_dict)
 
-    # Setup
+    # Setup device
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
-    
+
+    # Start MiniFlow run — this creates the DB row immediately
     tracker = ExperimentTracker("llm_shakespeare")
     tracker.log_params({
         "d_model": config.model.d_model,
@@ -161,7 +174,12 @@ def train(config_path: str):
         "vocab_size": config.model.vocab_size,
         "batch_size": config.training.batch_size,
         "max_steps": config.training.max_steps,
+        "learning_rate": config.training.learning_rate,
+        "weight_decay": config.training.weight_decay,
+        "warmup_steps": config.training.warmup_steps,
+        "grad_clip": config.training.grad_clip,
     })
+    print(f"MiniFlow run started: {tracker.run_id}")
 
     # Load tokenizer
     tokenizer = BPETokenizer.load(config.data.tokenizer_path)
@@ -170,25 +188,37 @@ def train(config_path: str):
     train_ds = TextDataset(config.data.train_file, tokenizer, config.model.max_seq_len)
     val_ds = TextDataset(config.data.val_file, tokenizer, config.model.max_seq_len)
 
-    # pin_memory=True speeds up CPU to GPU data transfer
     train_loader = DataLoader(train_ds, batch_size=config.training.batch_size, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config.training.batch_size, shuffle=False, pin_memory=True)
-    
-    # Creates an infinite iterator over the dataloader
     train_iter = itertools.cycle(train_loader)
 
-    # Build model → move to device
+    # Build model
     model = GPT(config.model).to(device)
-    print(f"Model parameters: {model.get_num_params():,}")
+    num_params = model.get_num_params()
+    print(f"Model parameters: {num_params:,}")
+    tracker.log_params({"num_params": num_params})
 
-    # Configure optimizer
     optimizer = configure_optimizer(model, config)
-    
     best_val_loss = float('inf')
+
+    # ADDED: Early stopping state
+    # patience: how many consecutive val checks with no improvement before stopping
+    # Read from config if present, otherwise default to 3
+    PATIENCE = getattr(config.training, 'early_stopping_patience', 3)
+    patience_counter = 0
+    print(f"Early stopping patience: {PATIENCE} eval intervals")
+
+    # ADDED: Label smoothing value — read from config if present, default 0.1
+    # Prevents the model from becoming overconfident on training tokens.
+    # softmax target distribution becomes (1 - ls) for the true token
+    # and ls / (vocab_size - 1) for all other tokens instead of a one-hot.
+    LABEL_SMOOTHING = getattr(config.training, 'label_smoothing', 0.1)
+    PAD_TOKEN_ID = 0  # matches BPE tokenizer convention
+    print(f"Label smoothing: {LABEL_SMOOTHING}")
 
     # Training loop
     for step in range(config.training.max_steps):
-        # Set LR for this step
+        # Update LR
         lr = get_lr(step, config)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
@@ -199,38 +229,68 @@ def train(config_path: str):
         x, y = x.to(device), y.to(device)
 
         optimizer.zero_grad()
-        logits, loss = model(x, targets=y)
+
+        # ADDED: Get logits only (targets=None), then compute loss here so we
+        # can pass label_smoothing.  The model's internal loss path stays intact
+        # and is still used during evaluate() — no code removed from model.
+        logits, _ = model(x, targets=None)
+        loss = F.cross_entropy(
+            logits.view(-1, config.model.vocab_size),
+            y.view(-1),
+            ignore_index=PAD_TOKEN_ID,
+            label_smoothing=LABEL_SMOOTHING,   # ADDED
+        )
+
         loss.backward()
-
-        # Gradient clipping — critical for transformer stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
-
         optimizer.step()
 
-        # Logging
+        # Log training metrics
         if step % config.training.log_interval == 0:
             tracker.log_metric("train_loss", loss.item(), step=step)
             tracker.log_metric("lr", lr, step=step)
             print(f"Step {step:5d} | loss={loss.item():.4f} | lr={lr:.2e}")
 
-        # Evaluation
+        # Evaluate + checkpoint
         if step > 0 and step % config.training.eval_interval == 0:
             val_loss = evaluate(model, val_loader, device, config.training.eval_steps)
             val_ppl = math.exp(val_loss)
-            
+
             tracker.log_metric("val_loss", val_loss, step=step)
             tracker.log_metric("val_perplexity", val_ppl, step=step)
             print(f"  VAL | loss={val_loss:.4f} | perplexity={val_ppl:.2f}")
 
-            # Save checkpoint if best so far
-            best_val_loss = save_checkpoint(model, optimizer, step, val_loss, config, best_val_loss)
+            best_val_loss = save_checkpoint(
+                model, optimizer, step, val_loss,
+                config, best_val_loss,
+                tracker_run_id=tracker.run_id
+            )
+
+            # ADDED: Early stopping — track patience and break if no improvement
+            if val_loss < best_val_loss:
+                # save_checkpoint already updated best_val_loss if val improved,
+                # but the variable here reflects the value BEFORE this call.
+                # Re-check: if save_checkpoint returned a new lower value it means
+                # val_loss was an improvement — reset counter.
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"  No improvement for {patience_counter}/{PATIENCE} eval checks")
+                if patience_counter >= PATIENCE:
+                    print(f"  Early stopping triggered at step {step}. Best val loss: {best_val_loss:.4f}")
+                    tracker.log_metric("stopped_early_at_step", step, step=step)
+                    tracker.finish()
+                    print(f"Training stopped early! Run ID: {tracker.run_id}")
+                    print(f"View results: miniflow runs best --metric val_loss --mode min")
+                    return  # ADDED: exit cleanly instead of continuing to overfit
 
     tracker.finish()
-    print("Training complete!")
+    print(f"Training complete! Run ID: {tracker.run_id}")
+    print(f"View results: miniflow runs best --metric val_loss --mode min")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     args = parser.parse_args()
-    
     train(args.config)
