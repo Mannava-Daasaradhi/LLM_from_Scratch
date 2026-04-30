@@ -23,9 +23,17 @@ def main():
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    config = ckpt["config"]
-    tokenizer = BPETokenizer.load(config.data.tokenizer_path)
-    model = GPT(config.model)
+    config_dict = ckpt["config"]
+
+    from dataclasses import dataclass
+    @dataclass
+    class ModelConfig:
+        vocab_size: int; d_model: int; n_heads: int; n_layers: int
+        d_ff: int; max_seq_len: int; dropout: float
+
+    model_cfg = ModelConfig(**config_dict['model'])
+    tokenizer = BPETokenizer.load(config_dict['data']['tokenizer_path'])
+    model = GPT(model_cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 

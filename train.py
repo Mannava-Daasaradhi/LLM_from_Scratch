@@ -125,19 +125,19 @@ def evaluate(model, val_loader, device, n_steps) -> float:
     return sum(losses) / len(losses)
 
 def save_checkpoint(model, optimizer, step, val_loss, config, best_val_loss):
-    """Save to checkpoints/step_{step}.pt. Keep only best (lowest val_loss)."""
-    os.makedirs(config.training.checkpoint_dir, exist_ok=True)
-    
     if val_loss < best_val_loss:
         ckpt_path = os.path.join(config.training.checkpoint_dir, "best.pt")
+        # Convert ConfigNode back to a plain dict for portability
+        import yaml
+        with open(config_path_global, 'r') as f:
+            config_dict = yaml.safe_load(f)
         torch.save({
             'step': step,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
-            'config': config # Save config so generation script knows the architecture
+            'config': config_dict  # plain dict, always picklable
         }, ckpt_path)
-        print(f"  --> Saved new best checkpoint to {ckpt_path}")
         return val_loss
     return best_val_loss
 
