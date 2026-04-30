@@ -6,13 +6,13 @@ model:
   n_layers: 6            # transformer blocks
   d_ff: 2048             # feed-forward hidden dim (4 * d_model)
   max_seq_len: 256       # context window
-  dropout: 0.3
+  dropout: 0.4           # CHANGED: increased from 0.3 → 0.4 to reduce overfitting
 
 # Training
 training:
   batch_size: 64
   learning_rate: 3.0e-4
-  weight_decay: 0.3
+  weight_decay: 0.1      # CHANGED: reduced from 0.3 → 0.1; 0.3 was too aggressive and harmed generalisation
   beta1: 0.9
   beta2: 0.95
   grad_clip: 1.0
@@ -22,6 +22,8 @@ training:
   eval_steps: 100        # number of batches to average val loss over
   checkpoint_dir: checkpoints/
   log_interval: 50
+  label_smoothing: 0.1          # ADDED: prevents overconfident predictions on training tokens
+  early_stopping_patience: 4    # ADDED: stop after 4 consecutive evals with no val improvement
 
 # Data
 data:

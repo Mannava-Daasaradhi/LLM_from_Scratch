@@ -39,7 +39,10 @@ class TextDataset(Dataset):
             text = f.read()
         self.tokens = torch.tensor(tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
         self.seq_len = seq_len
-        self.stride = seq_len // 2
+        # CHANGED: stride from seq_len//2 → seq_len (non-overlapping windows).
+        # 50% overlap meant ~2x duplicate token context per training step,
+        # causing the model to memorise specific windows and overfit.
+        self.stride = seq_len
 
     def __len__(self):
         return (len(self.tokens) - self.seq_len - 1) // self.stride
@@ -260,18 +263,19 @@ def train(config_path: str):
             tracker.log_metric("val_perplexity", val_ppl, step=step)
             print(f"  VAL | loss={val_loss:.4f} | perplexity={val_ppl:.2f}")
 
+            # FIXED: capture the current best BEFORE save_checkpoint overwrites it,
+            # so the patience check below compares against the pre-update best.
+            prev_best = best_val_loss
             best_val_loss = save_checkpoint(
                 model, optimizer, step, val_loss,
                 config, best_val_loss,
                 tracker_run_id=tracker.run_id
             )
 
-            # ADDED: Early stopping — track patience and break if no improvement
-            if val_loss < best_val_loss:
-                # save_checkpoint already updated best_val_loss if val improved,
-                # but the variable here reflects the value BEFORE this call.
-                # Re-check: if save_checkpoint returned a new lower value it means
-                # val_loss was an improvement — reset counter.
+            # FIXED: was comparing val_loss < best_val_loss AFTER save_checkpoint
+            # already updated best_val_loss, so patience_counter always reset to 0
+            # even when there was no real improvement — early stopping never fired.
+            if val_loss < prev_best:
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -282,7 +286,7 @@ def train(config_path: str):
                     tracker.finish()
                     print(f"Training stopped early! Run ID: {tracker.run_id}")
                     print(f"View results: miniflow runs best --metric val_loss --mode min")
-                    return  # ADDED: exit cleanly instead of continuing to overfit
+                    return  # exit cleanly instead of continuing to overfit
 
     tracker.finish()
     print(f"Training complete! Run ID: {tracker.run_id}")
