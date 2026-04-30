@@ -11,6 +11,19 @@ from tokenizer.bpe import BPETokenizer
 from model.transformer import GPT
 from config import load_config
 
+class ConfigNode:
+    """Helper class to access dict keys via dot notation"""
+    def __init__(self, d):
+        for k, v in d.items():
+            setattr(self, k, ConfigNode(v) if isinstance(v, dict) else v)
+            
+    # Add these two methods so it behaves like a dictionary too!
+    def __getitem__(self, key):
+        return getattr(self, key)
+        
+    def keys(self):
+        return self.__dict__.keys()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
