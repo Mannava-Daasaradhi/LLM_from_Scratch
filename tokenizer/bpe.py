@@ -70,6 +70,8 @@ class BPETokenizer:
 
         # 3. Repeat until vocab_size reached
         while len(self.vocab) < vocab_size:
+            if len(self.vocab) % 500 == 0:
+                print(f"Training BPE... Vocab size: {len(self.vocab)} / {vocab_size}")
             # a. Count all adjacent pair frequencies
             pairs = defaultdict(int)
             for word_tuple, freq in word_freqs.items():

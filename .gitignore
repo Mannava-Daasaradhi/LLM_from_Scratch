@@ -1,0 +1,43 @@
+# ========================
+# Python & Environments
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# ========================
+# PyTest
+# ========================
+.pytest_cache/
+
+# ========================
+# Project Data & Artifacts
+# ========================
+# Ignore downloaded/processed datasets but keep the download.py script
+data/*.txt
+
+# Ignore the trained tokenizer JSON (it's a build artifact)
+tokenizer/*.json
+
+# Ignore generated plots/images
+plots/*.png
+plots/*.jpg
+
+# ========================
+# PyTorch Checkpoints
+# ========================
+# NEVER commit model weights!
+checkpoints/*.pt
+checkpoints/*.pth
+*.pt
+*.pth
+
+# ========================
+# OS & IDE Files
+# ========================
+.DS_Store
+.vscode/
+.idea/

@@ -1,1 +1,4 @@
 pyyaml
+pytest
+torch
+numpy
