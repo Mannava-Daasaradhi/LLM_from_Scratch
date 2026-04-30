@@ -1,0 +1,33 @@
+# Model architecture
+model:
+  vocab_size: 10000      # BPE vocabulary size
+  d_model: 512           # embedding dimension
+  n_heads: 8             # attention heads
+  n_layers: 6            # transformer blocks
+  d_ff: 2048             # feed-forward hidden dim (4 * d_model)
+  max_seq_len: 256       # context window
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 64
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  warmup_steps: 100
+  max_steps: 5000
+  eval_interval: 500
+  eval_steps: 100        # number of batches to average val loss over
+  checkpoint_dir: checkpoints/
+  log_interval: 50
+
+# Data
+data:
+  train_file: data/train.txt
+  val_file: data/val.txt
+  tokenizer_path: tokenizer/shakespeare_bpe.json
+
+# Device
+device: cuda              # falls back to cpu if cuda unavailable
