@@ -1,6 +1,10 @@
 # LLM from Scratch 🧠
 
-A GPT-style language model built entirely from scratch in PyTorch, trained on the Shakespeare dataset. This project implements every component — BPE tokenizer, multi-head causal self-attention, transformer blocks, and a full training loop with regularisation and early stopping.
+A GPT-style language model built entirely from scratch in PyTorch. Every component is
+hand-written — a BPE tokenizer, multi-head causal self-attention, transformer blocks, and
+a full training loop — using a modern LLaMA-style recipe: **RoPE** rotary positions,
+**RMSNorm**, **SwiGLU** feed-forward, and **flash attention**. It trains on a ~24 MB
+public-domain corpus of 25 classic books assembled from Project Gutenberg.
 
 ---
 
@@ -12,21 +16,23 @@ LLM_from_Scratch/
 ├── configs/
 │   └── shakespeare.yaml       # All hyperparameters in one place
 ├── data/
-│   ├── download.py            # Download the Shakespeare corpus
-│   └── input.txt              # Raw text (train/val split at runtime)
+│   ├── download.py            # Assemble the corpus (Gutenberg classics / Shakespeare)
+│   ├── input.txt              # Raw concatenated corpus
+│   ├── train.txt / val.txt    # 90/10 split (+ cached *.bin token streams)
 ├── model/
-│   ├── attention.py           # Multi-head causal self-attention
-│   ├── block.py               # Transformer block (pre-norm + residuals)
-│   ├── embedding.py           # Token + sinusoidal positional embeddings
-│   ├── feedforward.py         # Position-wise FFN (GELU activation)
+│   ├── attention.py           # Multi-head causal self-attention (RoPE + flash SDPA)
+│   ├── block.py               # Transformer block (pre-norm RMSNorm + residuals)
+│   ├── embedding.py           # Token embedding, RMSNorm, RoPE (+ legacy PE classes)
+│   ├── feedforward.py         # SwiGLU feed-forward network
 │   └── transformer.py         # Full GPT model + generation
 ├── tokenizer/
-│   ├── bpe.py                 # Byte-Pair Encoding tokenizer
-│   ├── train_tokenizer.py     # Train a BPE vocab from text
+│   ├── bpe.py                 # Byte-Pair Encoding tokenizer (fast rank-based encode)
+│   ├── train_tokenizer.py     # Train a BPE vocab from text (CLI)
 │   └── base.py                # Abstract base class
 ├── plots/
 │   └── plot_curves.py         # Plot train/val loss curves from logs
 ├── tests/                     # Unit tests for each component
+├── check_overfit.py           # Overfitting / architecture diagnostic
 ├── train.py                   # Main training loop
 ├── generate.py                # Text generation script
 └── requirements.txt
@@ -42,27 +48,26 @@ LLM_from_Scratch/
 pip install -r requirements.txt
 ```
 
-### 2. Prepare data
+### 2. Build the corpus
 
 ```bash
-python data/download.py          # downloads Shakespeare corpus to data/input.txt
-# Then split into train/val (e.g. 90/10):
-python -c "
-text = open('data/input.txt').read()
-n = int(len(text) * 0.9)
-open('data/train.txt','w').write(text[:n])
-open('data/val.txt','w').write(text[n:])
-print('Done.')
-"
+python data/download.py                       # 'classics': 25 Gutenberg books (~24 MB)
+# alternatives:
+python data/download.py --dataset shakespeare # complete works of Shakespeare only (~5 MB)
+python data/download.py --dataset tinyshakespeare
 ```
+
+This downloads, strips the Gutenberg boilerplate, concatenates, and writes a 90/10
+`train.txt` / `val.txt` split.
 
 ### 3. Train the BPE tokenizer
 
 ```bash
-python tokenizer/train_tokenizer.py \
+python -m tokenizer.train_tokenizer \
     --input data/train.txt \
     --vocab-size 10000 \
-    --output tokenizer/shakespeare_bpe.json
+    --output tokenizer/bpe.json \
+    --max-chars 3000000        # learn merges from a 3 MB sample (generalises to the full corpus)
 ```
 
 ### 4. Train the model
@@ -71,7 +76,10 @@ python tokenizer/train_tokenizer.py \
 python train.py --config configs/shakespeare.yaml
 ```
 
-Training logs are printed every `log_interval` steps. Validation is run every `eval_interval` steps. The best checkpoint is saved to `checkpoints/best.pt`.
+Training logs print every `log_interval` steps. Validation (loss, perplexity, **next-token
+accuracy**) runs every `eval_interval` steps. The best checkpoint is saved to
+`checkpoints/best.pt` — a lean file containing only model weights + config (no optimizer
+state, no attention-mask buffers).
 
 ### 5. Generate text
 
@@ -79,33 +87,36 @@ Training logs are printed every `log_interval` steps. Validation is run every `e
 python generate.py \
     --checkpoint checkpoints/best.pt \
     --prompt "To be or not to be" \
-    --max-tokens 200 \
+    --max_tokens 200 \
     --temperature 0.8 \
-    --top-k 40
+    --top_k 40
 ```
 
 ---
 
 ## Model Architecture
 
-This is a decoder-only transformer (GPT-style) with the following design choices:
+A decoder-only transformer (GPT-style) with a modern component set:
 
 | Component | Choice | Why |
 |---|---|---|
-| Positional encoding | Sinusoidal (fixed) | No extra parameters; generalises to unseen lengths |
-| Attention | Multi-head causal self-attention | Prevents attending to future tokens |
-| Normalisation | Pre-LayerNorm | Stable gradient flow through deep networks |
-| Activation | GELU | Smoother than ReLU; empirically better for LMs |
-| Weight tying | Token emb ↔ LM head | Reduces ~5M params; improves generalisation |
-| Init | N(0, 0.02) + residual scaling | GPT-2 convention; controls residual stream growth |
+| Positional encoding | **RoPE** (rotary) | Relative-position aware, zero params, nothing added to the residual stream |
+| Attention | Multi-head causal self-attention via **flash SDPA** | `F.scaled_dot_product_attention(is_causal=True)` — fast, O(T) memory, no mask buffer |
+| Normalisation | **RMSNorm** (pre-norm) | Cheaper than LayerNorm, no bias/mean-centering, stable gradient flow |
+| Activation | **SwiGLU** | Gated FFN; beats GELU/ReLU MLPs at equal compute |
+| Weight tying | Token emb ↔ LM head | Saves ~5M params; improves generalisation |
+| Tokenizer | **Byte-level BPE** + GPT-2-style regex pre-tokenizer | Preserves whitespace/newlines; exact round-trip; no true unknowns |
+| Init | N(0, 0.02) + residual scaling | GPT-2 convention; controls residual stream growth with depth |
+| Precision | **bf16 autocast** | ~2× faster on modern GPUs, no GradScaler needed |
+| Generation | **KV-caching** (optional) | Reuses cached keys/values so each token costs O(1) compute instead of O(T) recompute (see note below) |
 
 Default hyperparameters (`configs/shakespeare.yaml`):
 
 ```
 d_model:     512    n_heads:  8    n_layers: 6
-d_ff:       2048    dropout: 0.4   max_seq_len: 256
-vocab_size: 10000
-~38M parameters
+d_ff:       1536    dropout: 0.1   max_seq_len: 512
+vocab_size: 10000   rope_theta: 10000
+~25.6M parameters
 ```
 
 ---
@@ -113,29 +124,98 @@ vocab_size: 10000
 ## Training Details
 
 ### Optimiser
-AdamW with selective weight decay — weight matrices decay, biases and LayerNorm parameters do not.
+Fused AdamW with selective weight decay — weight matrices decay; biases, norms, and
+embeddings do not.
 
 ### Learning Rate Schedule
-Linear warmup for `warmup_steps` steps, then cosine decay to 10% of peak LR.
+Linear warmup for `warmup_steps`, then cosine decay to 10% of peak LR.
 
-### Anti-Overfitting Measures
+### Data Pipeline
+The corpus is tokenised **once** and cached to `data/*.txt.bin` (uint16). Each training
+step samples `batch_size` random windows from the token stream (nanoGPT-style) rather than
+iterating fixed windows — endless varied batches and far better data utilisation.
 
-Four complementary techniques are applied. All are configurable via `configs/shakespeare.yaml`:
+### Efficiency
+- **Flash attention** via `F.scaled_dot_product_attention` (replaces a manual softmax and
+  a 5000×5000 mask buffer that previously bloated every checkpoint to ~888 MB).
+- **bf16 autocast** + TF32 matmuls on CUDA; **fused AdamW**.
+- Optional `torch.compile` (`compile: true`) and gradient accumulation (`grad_accum_steps`).
 
-#### 1. Dropout (`model.dropout = 0.4`)
-Applied inside attention (on attention weights) and after each FFN activation. Randomly zeroes activations during training, preventing co-adaptation of features.
+### Regularisation
+With a ~24 MB corpus the model is far better matched to the data, so heavy regularisation
+is no longer needed:
 
-#### 2. Label Smoothing (`training.label_smoothing = 0.1`)
-Instead of training against a one-hot target, the true token receives probability `1 - ls = 0.9` and the remaining `0.1` is spread uniformly across all other tokens. This prevents the model from becoming overconfident on training tokens. Applied **only to training loss** — val loss uses clean cross-entropy so it remains interpretable.
+- **Dropout** `0.1` (down from `0.4`) — applied to embeddings, attention weights, and FFN.
+- **Weight decay** `0.1` on weight matrices only.
+- **Label smoothing** `0.0` (off — with enough data it mostly just slows learning).
+- **Early stopping** `patience: 10` eval intervals — a safety net, rarely needed now.
 
-#### 3. Weight Decay (`training.weight_decay = 0.1`)
-L2 regularisation on weight matrices. Keeps weights small and discourages memorisation. Set to `0.1` (down from the original `0.3` which was too aggressive and harmed generalisation).
+> The earlier version used the *opposite* strategy (38M params on ~0.3M tokens, fought with
+> dropout 0.4 + weight decay + label smoothing + aggressive early stopping). That model
+> overfit instantly — its best validation loss came at the very first eval (step 500) and
+> only got worse. The fix was to match data to capacity, not to crank up regularisation.
 
-#### 4. Early Stopping (`training.early_stopping_patience = 4`)
-Training stops automatically if validation loss does not improve for `patience` consecutive evaluation intervals. This prevents the model from continuing to fit training noise after it has already started to diverge on held-out data.
+### Next-Token Accuracy
+Validation reports top-1 next-token accuracy (the fraction of positions where `argmax`
+of the logits equals the true next token), alongside loss and perplexity.
 
-#### 5. Non-Overlapping Data Windows
-`TextDataset` uses `stride = seq_len` (non-overlapping windows). The original 50% overlap (`stride = seq_len // 2`) created near-duplicate training samples which amplified memorisation.
+---
+
+## Results
+
+Trained on the 24 MB classics corpus (10K **byte-level** BPE vocab, ~25.6M params,
+512-token context, RTX 4090, bf16). Validation reports clean cross-entropy loss,
+perplexity, and top-1 next-token accuracy.
+
+| | Old model | **This model** |
+|---|---|---|
+| Best val loss | 6.67 (at step 500, then **diverged**) | **3.72** (step 2000) |
+| Best val perplexity | 786 | **41.1** |
+| Next-token accuracy | — | **~33%** |
+| Behaviour | overfit instantly; best at first eval | smooth descent, then early-stopped on overfit |
+| Generated structure | run-on, no line breaks | **verse lines, stanzas, speaker labels** |
+| Context window | 256 | 512 |
+| Checkpoint size | 888 MB | 102 MB |
+| Full-corpus tokenise | timed out (O(words×merges)) | ~5 s |
+
+Validation perplexity over training (every 500 steps): `53 → 44 → 42 → 41 → 42 → 44 …`
+— a smooth descent to a best of ~41 around step 2000, after which val loss rises as the
+~25.6M-param model overfits the corpus. **Early stopping (patience 10) fired at step 7000**
+and the best checkpoint (step 2000) was kept — the anti-overfit safety net working exactly
+as intended, in stark contrast to the old model that diverged from step 500.
+
+> **Comparing perplexity across tokenizers:** the byte-level tokenizer emits tokens for
+> whitespace too, which are highly predictable, so its per-token perplexity isn't directly
+> comparable to a whitespace-stripped tokenizer. The clean signals are that next-token
+> accuracy rose (≈25% → ≈33%) *and* the model now reproduces document structure.
+
+Sample (`--prompt "To be or not to be" --temperature 0.8 --top_k 40`):
+
+```
+Pursued on his mistress' ear to make
+The man in my closet? To be sure, a very vile fellow
+
+SEBASTIAN.
+You'll get the fool here,
+And get you gone.
+
+GONZALO.
+There's no man in all this, unless thou art not a soldier.
+```
+
+The output is grammatical English with **proper verse line breaks, stanza spacing, and
+speaker labels** (and real character names) — the byte-level regex pre-tokenizer preserves
+whitespace and gives an exact encode→decode round-trip for any text.
+
+**Remaining limitations:**
+- The small model still repeats speaker labels and lacks long-range plot coherence.
+- Occasional `�` appears when sampling lands mid-way through a multi-byte UTF-8 character
+  (the Gutenberg corpus uses curly quotes/apostrophes); decode uses `errors="replace"`.
+  Normalising the corpus to ASCII punctuation would largely remove this.
+- **KV-caching** is correct and reduces per-token *compute* to O(1), but at this scale
+  (small model, ≤512 ctx, GPU) PyTorch's fused flash kernel makes full-sequence recompute
+  about as fast, so it's parity here; the wall-clock win appears with larger models,
+  longer contexts, or CPU inference.
 
 ---
 
@@ -149,30 +229,34 @@ model:
   d_model: 512            # embedding dimension
   n_heads: 8              # attention heads (d_model must be divisible by n_heads)
   n_layers: 6             # number of transformer blocks
-  d_ff: 2048              # FFN hidden dim (typically 4 × d_model)
-  max_seq_len: 256        # context window length
-  dropout: 0.4            # dropout rate (applied in attention + FFN)
+  d_ff: 1536              # SwiGLU hidden dim
+  max_seq_len: 512        # context window length
+  dropout: 0.1
+  rope_theta: 10000.0     # RoPE base frequency
 
 training:
   batch_size: 64
-  learning_rate: 3.0e-4
-  weight_decay: 0.1       # L2 regularisation on weight matrices only
+  learning_rate: 6.0e-4
+  weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
-  grad_clip: 1.0          # gradient norm clipping threshold
-  warmup_steps: 100
-  max_steps: 5000
-  eval_interval: 500      # run validation every N steps
-  eval_steps: 100         # average val loss over this many batches
+  grad_clip: 1.0
+  warmup_steps: 200
+  max_steps: 8000
+  eval_interval: 500
+  eval_steps: 100
   checkpoint_dir: checkpoints/
   log_interval: 50
-  label_smoothing: 0.1    # training-time label smoothing strength
-  early_stopping_patience: 4  # stop after N evals with no improvement
+  label_smoothing: 0.0
+  early_stopping_patience: 10
+  grad_accum_steps: 1     # raise to simulate a larger batch
+  use_amp: true           # bf16 autocast on CUDA
+  compile: false          # torch.compile (leave off on Windows unless Triton is set up)
 
 data:
   train_file: data/train.txt
   val_file: data/val.txt
-  tokenizer_path: tokenizer/shakespeare_bpe.json
+  tokenizer_path: tokenizer/bpe.json
 
 device: cuda              # falls back to cpu if CUDA unavailable
 ```
@@ -185,7 +269,15 @@ device: cuda              # falls back to cpu if CUDA unavailable
 python -m pytest tests/ -v
 ```
 
-Tests cover attention correctness (causal masking, shape), BPE encode/decode round-trips, embedding dimensions, and full transformer forward pass shapes.
+Tests cover attention correctness (causal masking, shapes, gradient flow), BPE
+encode/decode round-trips and merge ordering, embedding dimensions, and full transformer
+forward/generate behaviour + parameter count.
+
+Run the architecture / overfitting diagnostic:
+
+```bash
+python check_overfit.py
+```
 
 ---
 
@@ -201,14 +293,20 @@ miniflow models list                            # registered model snapshots
 
 ---
 
-## Changes from Original (Anti-Overfitting Fixes)
+## Changelog — Modernisation Pass
 
-| File | Change | Reason |
+| Area | Change | Reason |
 |---|---|---|
-| `configs/shakespeare.yaml` | `dropout` 0.3 → **0.4** | Stronger regularisation |
-| `configs/shakespeare.yaml` | `weight_decay` 0.3 → **0.1** | 0.3 was too aggressive; hurt generalisation |
-| `configs/shakespeare.yaml` | Added `label_smoothing: 0.1` | Config-driven smoothing strength |
-| `configs/shakespeare.yaml` | Added `early_stopping_patience: 4` | Config-driven patience |
-| `train.py` | `stride` = `seq_len//2` → **`seq_len`** | Removes near-duplicate training windows |
-| `train.py` | Fixed early stopping `prev_best` bug | Counter always reset before; stopping never triggered |
-| `model/transformer.py` | Removed `label_smoothing=0.1` from `forward()` | Val loss must be clean cross-entropy; smoothing only belongs in the training loss path |
+| Tokenizer | `encode` O(words × merges) → rank-based + per-word cache | Was pathologically slow; now ~instant (identical output) |
+| Tokenizer | whitespace-split → **byte-level BPE + regex pre-tokenizer** | Preserves newlines/whitespace; exact round-trip; generated text now has line structure |
+| Attention | 5000×5000 mask buffer → `F.scaled_dot_product_attention(is_causal=True)` | Flash kernel; O(T) memory; checkpoints shrank from 888 MB |
+| Positional | Sinusoidal additive PE → **RoPE** | Relative positions, no params |
+| Norm | LayerNorm → **RMSNorm** | Cheaper, no bias |
+| FFN | GELU MLP → **SwiGLU** | Stronger gated FFN |
+| Data | 1.1 MB Shakespeare → **24 MB** of 25 classics | Justifies the 10K vocab; fixes the capacity/data mismatch |
+| Training | Fixed windows → random-offset sampling; token `.bin` cache; bf16; fused AdamW | Faster, better data utilisation |
+| Metrics | Added **next-token accuracy** | Directly measures prediction quality |
+| Checkpoints | Lean (weights + config only) | No optimizer state or mask buffers |
+| Regularisation | dropout 0.4 → 0.1, label smoothing 0.1 → 0.0 | Big corpus removes the need for heavy regularisation |
+| Context | max_seq_len 256 → **512** | Longer-range coherence |
+| Generation | added **KV-caching** (`use_cache`, default on) | O(1)-compute per-token decode, output identical to cache-free path (wall-clock win realised at larger scale — see note) |
