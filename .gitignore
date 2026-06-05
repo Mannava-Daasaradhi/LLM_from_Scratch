@@ -43,3 +43,8 @@ checkpoints/*.pth
 .DS_Store
 .vscode/
 .idea/
+
+# ========================
+# Books / large binaries (don't commit copyrighted PDFs)
+# ========================
+*.pdf
