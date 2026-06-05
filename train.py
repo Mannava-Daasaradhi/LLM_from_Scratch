@@ -5,17 +5,18 @@ Full training script. Run as:
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import yaml
 import argparse
 import math
 import os
-import itertools
-from pathlib import Path
+import time
 
 from tokenizer.bpe import BPETokenizer
 from model.transformer import GPT
 from miniflow import ExperimentTracker, ModelRegistry
+
+PAD_TOKEN_ID = 0  # matches BPE tokenizer convention
 
 
 # --- Dynamic Config Loader ---
@@ -26,49 +27,60 @@ class ConfigNode:
             setattr(self, k, ConfigNode(v) if isinstance(v, dict) else v)
 
 
-# --- Dataset ---
-class TextDataset(Dataset):
+# --- Tokenised data (cached to .bin so we encode the corpus only once) ---
+def load_tokens(filepath: str, tokenizer, tokenizer_path: str = None) -> np.ndarray:
     """
-    Loads tokenized text and returns (input_ids, targets) pairs.
-    input_ids:  tokens[i : i + seq_len]
-    targets:    tokens[i+1 : i + seq_len + 1]  (next-token prediction)
-    Stride: seq_len // 2 (50% overlap between consecutive windows — more training examples)
+    Encode `filepath` to a flat uint16 token array, cached next to it as `<file>.bin`.
+    Re-encodes if the cache is missing or older than the source text OR the tokenizer
+    (so changing the tokenizer correctly invalidates stale token streams).
+    uint16 is safe because vocab_size (10 000) < 65 536.
     """
-    def __init__(self, filepath: str, tokenizer, seq_len: int):
-        with open(filepath, encoding='utf-8') as f:
-            text = f.read()
-        self.tokens = torch.tensor(tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
-        self.seq_len = seq_len
-        # CHANGED: stride from seq_len//2 → seq_len (non-overlapping windows).
-        # 50% overlap meant ~2x duplicate token context per training step,
-        # causing the model to memorise specific windows and overfit.
-        self.stride = seq_len
+    cache_path = filepath + ".bin"
+    if os.path.exists(cache_path):
+        fresh = os.path.getmtime(cache_path) >= os.path.getmtime(filepath)
+        if tokenizer_path and os.path.exists(tokenizer_path):
+            fresh = fresh and os.path.getmtime(cache_path) >= os.path.getmtime(tokenizer_path)
+        if fresh:
+            return np.fromfile(cache_path, dtype=np.uint16)
 
-    def __len__(self):
-        return (len(self.tokens) - self.seq_len - 1) // self.stride
+    with open(filepath, encoding="utf-8") as f:
+        text = f.read()
+    t0 = time.time()
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    arr = np.array(ids, dtype=np.uint16)
+    arr.tofile(cache_path)
+    print(f"  Tokenised {filepath}: {len(text):,} chars -> {len(arr):,} tokens "
+          f"in {time.time() - t0:.1f}s (cached to {cache_path})")
+    return arr
 
-    def __getitem__(self, idx):
-        start = idx * self.stride
-        x = self.tokens[start : start + self.seq_len]
-        y = self.tokens[start + 1 : start + self.seq_len + 1]
-        return x, y
+
+def get_batch(data: np.ndarray, batch_size: int, seq_len: int, device) -> tuple:
+    """
+    Sample `batch_size` random windows of length `seq_len` from the token stream.
+    Random offsets (nanoGPT-style) give endless varied batches and far better data
+    utilisation than fixed non-overlapping windows.
+    """
+    ix = torch.randint(len(data) - seq_len - 1, (batch_size,))
+    x = torch.stack([torch.from_numpy(data[i:i + seq_len].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + seq_len].astype(np.int64)) for i in ix])
+    if device.type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
 
 
 # --- Optimizer ---
 def configure_optimizer(model, config):
     """
-    Apply weight decay only to weight matrices, NOT to:
-    - Bias terms
-    - LayerNorm weights and biases
-    - Embedding weights
+    Weight decay on weight matrices only — not biases, norms, or embeddings.
     """
-    decay_params = []
-    no_decay_params = []
-
+    decay_params, no_decay_params = [], []
     for pn, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if pn.endswith('bias') or 'norm' in pn or 'emb' in pn or 'pe' in pn:
+        if pn.endswith("bias") or "norm" in pn or "emb" in pn:
             no_decay_params.append(p)
         else:
             decay_params.append(p)
@@ -77,11 +89,13 @@ def configure_optimizer(model, config):
         {"params": decay_params, "weight_decay": config.training.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
-
+    # fused AdamW is faster on CUDA
+    use_fused = torch.cuda.is_available()
     return torch.optim.AdamW(
         param_groups,
         lr=config.training.learning_rate,
-        betas=(config.training.beta1, config.training.beta2)
+        betas=(config.training.beta1, config.training.beta2),
+        fused=use_fused,
     )
 
 
@@ -97,86 +111,105 @@ def get_lr(step: int, config) -> float:
         return max_lr * (step + 1) / warmup_steps
     if step > max_steps:
         return min_lr
-
     progress = (step - warmup_steps) / (max_steps - warmup_steps)
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 # --- Evaluation ---
 @torch.no_grad()
-def evaluate(model, val_loader, device, n_steps) -> float:
-    """Average val loss over n_steps batches."""
+def evaluate(model, val_data, config, device, amp_ctx) -> tuple[float, float]:
+    """
+    Average val loss (clean cross-entropy) and next-token top-1 accuracy over
+    eval_steps random batches. Accuracy directly answers 'how often does the model
+    predict the correct next token', which loss/perplexity only describe indirectly.
+    """
     model.eval()
-    losses = []
-    for i, (x, y) in enumerate(val_loader):
-        if i >= n_steps:
-            break
-        x, y = x.to(device), y.to(device)
-        _, loss = model(x, targets=y)
+    bs, sl = config.training.batch_size, config.model.max_seq_len
+    losses, correct, total = [], 0, 0
+    for _ in range(config.training.eval_steps):
+        x, y = get_batch(val_data, bs, sl, device)
+        with amp_ctx:
+            logits, loss = model(x, targets=y)
         losses.append(loss.item())
-    return sum(losses) / len(losses)
+        preds = logits.argmax(dim=-1)
+        mask = y != PAD_TOKEN_ID
+        correct += (preds[mask] == y[mask]).sum().item()
+        total += mask.sum().item()
+    model.train()
+    return sum(losses) / len(losses), (correct / total if total else 0.0)
 
 
 # --- Checkpoint + Registry ---
-def save_checkpoint(model, optimizer, step, val_loss, config, best_val_loss, tracker_run_id: str) -> float:
+def _clean_state_dict(model) -> dict:
+    """Unwrap torch.compile (`_orig_mod.` prefix) so checkpoints load anywhere."""
+    raw = getattr(model, "_orig_mod", model)
+    return raw.state_dict()
+
+
+def save_checkpoint(model, step, val_loss, val_acc, config_dict, best_val_loss,
+                    tracker_run_id: str) -> float:
     """
-    Saves best checkpoint to disk via torch and registers it with
-    MiniFlow ModelRegistry so it appears under `miniflow models list`.
-    Returns updated best_val_loss.
+    Save a *lean* best checkpoint (model weights + config + metadata only — no
+    optimizer state and no attention-mask buffers, so the file is small) and
+    register it with MiniFlow. Returns the updated best_val_loss.
     """
     if val_loss >= best_val_loss:
         return best_val_loss
 
-    os.makedirs(config.training.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(config.training.checkpoint_dir, "best.pt")
-
+    os.makedirs(config_dict["training"]["checkpoint_dir"], exist_ok=True)
+    ckpt_path = os.path.join(config_dict["training"]["checkpoint_dir"], "best.pt")
     torch.save({
-        'step': step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_loss,
-        'config': config,
+        "step": step,
+        "model_state_dict": _clean_state_dict(model),
+        "val_loss": val_loss,
+        "val_accuracy": val_acc,
+        "config": config_dict,
     }, ckpt_path)
     print(f"  --> Saved new best checkpoint to {ckpt_path}")
 
-    # Register the model with MiniFlow so it's queryable via CLI
     registry = ModelRegistry()
     model_id = registry.save(
-        name="gpt_shakespeare",
-        model_obj=model,
+        name="gpt_classics",
+        model_obj=getattr(model, "_orig_mod", model),
         metadata={
             "step": step,
             "val_loss": round(val_loss, 4),
             "val_perplexity": round(math.exp(val_loss), 4),
+            "val_accuracy": round(val_acc, 4),
             "run_id": tracker_run_id,
             "checkpoint_path": ckpt_path,
-        }
+        },
     )
     print(f"  --> Registered model as '{model_id}' in MiniFlow registry")
-
     return val_loss
 
 
 # --- Main Loop ---
 def train(config_path: str):
-    # Load config
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config_dict = yaml.safe_load(f)
     config = ConfigNode(config_dict)
 
-    # Setup device
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
+    torch.manual_seed(1337)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True   # faster matmuls
+        torch.backends.cudnn.allow_tf32 = True
 
-    # Start MiniFlow run — this creates the DB row immediately
-    tracker = ExperimentTracker("llm_shakespeare")
+    # Mixed precision context (bf16 on CUDA needs no GradScaler)
+    use_amp = getattr(config.training, "use_amp", True) and device.type == "cuda"
+    amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if use_amp else torch.autocast(device_type="cpu", enabled=False))
+    print(f"Mixed precision (bf16 autocast): {use_amp}")
+
+    # MiniFlow run
+    tracker = ExperimentTracker("llm_classics")
     tracker.log_params({
-        "d_model": config.model.d_model,
-        "n_layers": config.model.n_layers,
-        "n_heads": config.model.n_heads,
-        "vocab_size": config.model.vocab_size,
-        "batch_size": config.training.batch_size,
-        "max_steps": config.training.max_steps,
+        "d_model": config.model.d_model, "n_layers": config.model.n_layers,
+        "n_heads": config.model.n_heads, "vocab_size": config.model.vocab_size,
+        "max_seq_len": config.model.max_seq_len, "dropout": config.model.dropout,
+        "batch_size": config.training.batch_size, "max_steps": config.training.max_steps,
         "learning_rate": config.training.learning_rate,
         "weight_decay": config.training.weight_decay,
         "warmup_steps": config.training.warmup_steps,
@@ -184,109 +217,92 @@ def train(config_path: str):
     })
     print(f"MiniFlow run started: {tracker.run_id}")
 
-    # Load tokenizer
+    # Data
     tokenizer = BPETokenizer.load(config.data.tokenizer_path)
+    train_data = load_tokens(config.data.train_file, tokenizer, config.data.tokenizer_path)
+    val_data = load_tokens(config.data.val_file, tokenizer, config.data.tokenizer_path)
+    print(f"Train tokens: {len(train_data):,} | Val tokens: {len(val_data):,}")
 
-    # Build datasets + dataloaders
-    train_ds = TextDataset(config.data.train_file, tokenizer, config.model.max_seq_len)
-    val_ds = TextDataset(config.data.val_file, tokenizer, config.model.max_seq_len)
-
-    train_loader = DataLoader(train_ds, batch_size=config.training.batch_size, shuffle=True, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config.training.batch_size, shuffle=False, pin_memory=True)
-    train_iter = itertools.cycle(train_loader)
-
-    # Build model
+    # Model
     model = GPT(config.model).to(device)
     num_params = model.get_num_params()
     print(f"Model parameters: {num_params:,}")
     tracker.log_params({"num_params": num_params})
 
     optimizer = configure_optimizer(model, config)
-    best_val_loss = float('inf')
 
-    # ADDED: Early stopping state
-    # patience: how many consecutive val checks with no improvement before stopping
-    # Read from config if present, otherwise default to 3
-    PATIENCE = getattr(config.training, 'early_stopping_patience', 3)
+    if getattr(config.training, "compile", False) and device.type == "cuda":
+        try:
+            model = torch.compile(model)
+            print("torch.compile enabled")
+        except Exception as e:
+            print(f"torch.compile failed ({e}); continuing uncompiled")
+
+    grad_accum = max(1, getattr(config.training, "grad_accum_steps", 1))
+    label_smoothing = getattr(config.training, "label_smoothing", 0.0)
+    patience = getattr(config.training, "early_stopping_patience", 999999)
+    print(f"grad_accum_steps={grad_accum} | label_smoothing={label_smoothing} | "
+          f"early_stopping_patience={patience}")
+
+    best_val_loss = float("inf")
     patience_counter = 0
-    print(f"Early stopping patience: {PATIENCE} eval intervals")
+    bs, sl = config.training.batch_size, config.model.max_seq_len
+    t_log = time.time()
 
-    # ADDED: Label smoothing value — read from config if present, default 0.1
-    # Prevents the model from becoming overconfident on training tokens.
-    # softmax target distribution becomes (1 - ls) for the true token
-    # and ls / (vocab_size - 1) for all other tokens instead of a one-hot.
-    LABEL_SMOOTHING = getattr(config.training, 'label_smoothing', 0.1)
-    PAD_TOKEN_ID = 0  # matches BPE tokenizer convention
-    print(f"Label smoothing: {LABEL_SMOOTHING}")
-
-    # Training loop
     for step in range(config.training.max_steps):
-        # Update LR
         lr = get_lr(step, config)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
 
-        # Forward + backward
         model.train()
-        x, y = next(train_iter)
-        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        loss_accum = 0.0
+        # Gradient accumulation: split the effective batch into grad_accum micro-batches
+        for _ in range(grad_accum):
+            x, y = get_batch(train_data, bs, sl, device)
+            with amp_ctx:
+                logits, _ = model(x, targets=None)
+                loss = F.cross_entropy(
+                    logits.view(-1, config.model.vocab_size), y.view(-1),
+                    ignore_index=PAD_TOKEN_ID, label_smoothing=label_smoothing,
+                )
+            (loss / grad_accum).backward()
+            loss_accum += loss.item() / grad_accum
 
-        optimizer.zero_grad()
-
-        # ADDED: Get logits only (targets=None), then compute loss here so we
-        # can pass label_smoothing.  The model's internal loss path stays intact
-        # and is still used during evaluate() — no code removed from model.
-        logits, _ = model(x, targets=None)
-        loss = F.cross_entropy(
-            logits.view(-1, config.model.vocab_size),
-            y.view(-1),
-            ignore_index=PAD_TOKEN_ID,
-            label_smoothing=LABEL_SMOOTHING,   # ADDED
-        )
-
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
         optimizer.step()
 
-        # Log training metrics
         if step % config.training.log_interval == 0:
-            tracker.log_metric("train_loss", loss.item(), step=step)
+            dt = time.time() - t_log
+            t_log = time.time()
+            tracker.log_metric("train_loss", loss_accum, step=step)
             tracker.log_metric("lr", lr, step=step)
-            print(f"Step {step:5d} | loss={loss.item():.4f} | lr={lr:.2e}")
+            print(f"Step {step:5d} | loss={loss_accum:.4f} | lr={lr:.2e} | "
+                  f"{dt / max(1, config.training.log_interval) * 1000:.0f} ms/step")
 
-        # Evaluate + checkpoint
         if step > 0 and step % config.training.eval_interval == 0:
-            val_loss = evaluate(model, val_loader, device, config.training.eval_steps)
+            val_loss, val_acc = evaluate(model, val_data, config, device, amp_ctx)
             val_ppl = math.exp(val_loss)
-
             tracker.log_metric("val_loss", val_loss, step=step)
             tracker.log_metric("val_perplexity", val_ppl, step=step)
-            print(f"  VAL | loss={val_loss:.4f} | perplexity={val_ppl:.2f}")
+            tracker.log_metric("val_accuracy", val_acc, step=step)
+            print(f"  VAL | loss={val_loss:.4f} | perplexity={val_ppl:.2f} | "
+                  f"next-token acc={val_acc * 100:.2f}%")
 
-            # FIXED: capture the current best BEFORE save_checkpoint overwrites it,
-            # so the patience check below compares against the pre-update best.
             prev_best = best_val_loss
             best_val_loss = save_checkpoint(
-                model, optimizer, step, val_loss,
-                config, best_val_loss,
-                tracker_run_id=tracker.run_id
+                model, step, val_loss, val_acc, config_dict, best_val_loss, tracker.run_id
             )
-
-            # FIXED: was comparing val_loss < best_val_loss AFTER save_checkpoint
-            # already updated best_val_loss, so patience_counter always reset to 0
-            # even when there was no real improvement — early stopping never fired.
             if val_loss < prev_best:
                 patience_counter = 0
             else:
                 patience_counter += 1
-                print(f"  No improvement for {patience_counter}/{PATIENCE} eval checks")
-                if patience_counter >= PATIENCE:
-                    print(f"  Early stopping triggered at step {step}. Best val loss: {best_val_loss:.4f}")
+                print(f"  No improvement for {patience_counter}/{patience} eval checks")
+                if patience_counter >= patience:
+                    print(f"  Early stopping at step {step}. Best val loss: {best_val_loss:.4f}")
                     tracker.log_metric("stopped_early_at_step", step, step=step)
                     tracker.finish()
-                    print(f"Training stopped early! Run ID: {tracker.run_id}")
-                    print(f"View results: miniflow runs best --metric val_loss --mode min")
-                    return  # exit cleanly instead of continuing to overfit
+                    return
 
     tracker.finish()
     print(f"Training complete! Run ID: {tracker.run_id}")

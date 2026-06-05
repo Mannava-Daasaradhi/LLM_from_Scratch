@@ -5,7 +5,7 @@ import math
 from typing import Optional
 
 # Importing components we built in previous steps
-from model.embedding import TokenEmbedding, SinusoidalPositionalEncoding
+from model.embedding import TokenEmbedding, RMSNorm
 from model.block import TransformerBlock
 
 # We assume config.py exists based on Step 1 of the master plan
@@ -37,28 +37,34 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
-        
+        rope_theta = getattr(config, 'rope_theta', 10000.0)
+
         # 1. Components
         self.token_emb = TokenEmbedding(config.vocab_size, config.d_model)
-        self.pos_enc = SinusoidalPositionalEncoding(config.d_model, config.max_seq_len, config.dropout)
-        
+        self.emb_dropout = nn.Dropout(config.dropout)   # dropout on the token embeddings
+
         self.blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout)
+            TransformerBlock(
+                config.d_model, config.n_heads, config.d_ff, config.dropout,
+                max_seq_len=config.max_seq_len, rope_theta=rope_theta,
+            )
             for _ in range(config.n_layers)
         ])
-        
-        self.norm = nn.LayerNorm(config.d_model)
+
+        self.norm = RMSNorm(config.d_model)   # final norm before projection
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        
-        # 2. Weight Tying
+
+        # 2. Weight Tying — share token embedding and LM-head weights.
         self.head.weight = self.token_emb.embedding.weight
-        
-        # 3. Parameter Initialization
+
+        # 3. Parameter Initialization (GPT-2 convention)
         self.apply(self._init_weights)
-        
-        # Apply special scaled initialization to the residual projections
+
+        # Scaled init for the residual projections (attention out_proj + SwiGLU
+        # down-projection w2): std *= 1/sqrt(2 * n_layers) so the residual stream
+        # variance does not grow with depth.
         for pn, p in self.named_parameters():
-            if pn.endswith('out_proj.weight') or pn.endswith('linear2.weight'):
+            if pn.endswith('out_proj.weight') or pn.endswith('w2.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module):
@@ -68,15 +74,16 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
 
     def forward(
         self,
         input_ids: torch.Tensor,        # (B, T)
         targets: Optional[torch.Tensor] = None,   # (B, T) — if provided, compute loss
-        key_padding_mask: Optional[torch.Tensor] = None
+        key_padding_mask: Optional[torch.Tensor] = None,
+        past_kvs: Optional[list] = None,          # per-layer (k, v) caches
+        use_cache: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         1. x = self.token_emb(input_ids)    # (B, T, d_model)
@@ -97,19 +104,33 @@ class GPT(nn.Module):
                return logits, None
         """
         B, T = input_ids.size()
-        
-        # 1 & 2. Embeddings + Positional Encoding
+
+        # 1. Token embeddings (+ dropout). Position is injected by RoPE inside
+        #    attention, so there is no additive positional encoding here.
         x = self.token_emb(input_ids)
-        x = self.pos_enc(x)
-        
-        # 3. Transformer Blocks
+        x = self.emb_dropout(x)
+
+        # 2. Transformer Blocks
+        if use_cache:
+            # Incremental-decoding path: thread per-layer K/V caches through and
+            # return them. Used only by generate(); training never sets use_cache.
+            presents = []
+            for i, block in enumerate(self.blocks):
+                past = past_kvs[i] if past_kvs is not None else None
+                x, present = block(x, key_padding_mask=key_padding_mask,
+                                   past_kv=past, use_cache=True)
+                presents.append(present)
+            x = self.norm(x)
+            logits = self.head(x)
+            return logits, presents
+
         for block in self.blocks:
             x = block(x, key_padding_mask=key_padding_mask)
-            
+
         # 4 & 5. Final Norm & Head
         x = self.norm(x)
         logits = self.head(x)
-        
+
         # 6. Loss Calculation
         loss = None
         if targets is not None:
@@ -135,21 +156,36 @@ class GPT(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """
-        Autoregressive generation loop.
-        ... (Documentation preserved from prompt) ...
+        Autoregressive generation loop with optional KV-caching.
+
+        With use_cache=True (default) the prompt is processed once to prime per-layer
+        K/V caches, then each new token is generated by running the model on just that
+        single token — turning per-step cost from O(T) (recompute the whole prefix) into
+        O(1). RoPE handles the absolute position via the cache offset. Output is identical
+        to the cache-free path; use_cache=False forces the simple full-recompute loop.
         """
-        self.eval() # Ensure we are in eval mode (no dropout)
-        
-        for _ in range(max_new_tokens):
-            # 1. Truncate context if it gets too long
-            idx_cond = input_ids if input_ids.size(1) <= self.config.max_seq_len else input_ids[:, -self.config.max_seq_len:]
-            
-            # 2. Forward pass to get logits for the last token
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] # (1, vocab_size)
-            
+        self.eval()  # no dropout
+
+        past_kvs = None
+        for step in range(max_new_tokens):
+            # 1. Choose the input for this step
+            if use_cache and past_kvs is not None:
+                idx_cond = input_ids[:, -1:]                      # only the newest token
+            else:
+                # First step (or no cache): feed the (truncated) prompt
+                idx_cond = (input_ids if input_ids.size(1) <= self.config.max_seq_len
+                            else input_ids[:, -self.config.max_seq_len:])
+
+            # 2. Forward pass to get logits for the last position
+            if use_cache:
+                logits, past_kvs = self(idx_cond, past_kvs=past_kvs, use_cache=True)
+            else:
+                logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]  # (1, vocab_size)
+
             # 3. Apply temperature
             if temperature <= 0.0:
                 # Greedy decoding for T=0

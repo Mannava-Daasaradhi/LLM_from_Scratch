@@ -18,6 +18,8 @@ env/
 # ========================
 # Ignore downloaded/processed datasets but keep the download.py script
 data/*.txt
+# Ignore cached tokenised streams (rebuilt automatically on first training run)
+data/*.bin
 
 # Ignore the trained tokenizer JSON (it's a build artifact)
 tokenizer/*.json
@@ -41,3 +43,8 @@ checkpoints/*.pth
 .DS_Store
 .vscode/
 .idea/
+
+# ========================
+# Books / large binaries (don't commit copyrighted PDFs)
+# ========================
+*.pdf

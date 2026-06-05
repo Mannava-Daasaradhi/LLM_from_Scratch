@@ -19,10 +19,14 @@ class TokenEmbedding(nn.Module):
         """
         x: (batch_size, seq_len) — token IDs
         Returns: (batch_size, seq_len, d_model)
-        Multiply output by sqrt(d_model) — this is the scaling from the original paper.
-        Reason: keeps embedding magnitudes comparable to positional encodings.
+
+        NOTE: no sqrt(d_model) scaling. That scaling (from the original Transformer)
+        balanced token embeddings against *additive* positional encodings. We now use
+        RoPE (rotary), which is applied inside attention and adds nothing to the
+        residual stream, so the GPT-2 convention of unscaled 0.02-init embeddings
+        (also tied to the LM head) is the correct choice here.
         """
-        return self.embedding(x) * math.sqrt(self.d_model)
+        return self.embedding(x)
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_seq_len: int = 5000, dropout: float = 0.1):
@@ -87,3 +91,80 @@ class LearnedPositionalEncoding(nn.Module):
         positions = torch.arange(seq_len, dtype=torch.long, device=x.device)
         x = x + self.embedding(positions).unsqueeze(0)
         return self.dropout(x)
+
+
+class RMSNorm(nn.Module):
+    """
+    Root-Mean-Square LayerNorm (Zhang & Sennrich, 2019), as used by LLaMA/Mistral.
+
+    Drops the mean-centering and bias of LayerNorm — it only rescales by the RMS of
+    the activations and applies a learned per-channel gain. Cheaper and empirically
+    as good or better for transformers. Computed in fp32 for numerical stability
+    even under bf16/fp16 autocast.
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (self.weight.float() * xf).to(in_dtype)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the last dimension by splitting it in half: [a, b] -> [-b, a]."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary(q: torch.Tensor, k: torch.Tensor,
+                 cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary position embeddings to query and key tensors.
+    q, k:     (B, H, T, head_dim)
+    cos, sin: (1, 1, T, head_dim)
+    """
+    cos = cos.to(q.dtype)
+    sin = sin.to(q.dtype)
+    q_out = (q * cos) + (rotate_half(q) * sin)
+    k_out = (k * cos) + (rotate_half(k) * sin)
+    return q_out, k_out
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Positional Embedding (Su et al., 2021 — RoPE).
+
+    Instead of *adding* a positional vector to the token embedding, RoPE rotates the
+    query/key vectors by an angle proportional to their absolute position. The dot
+    product in attention then depends only on *relative* position, which generalises
+    better to long contexts and adds zero learned parameters / nothing to the
+    residual stream. cos/sin tables are cached lazily and never stored in the
+    checkpoint (persistent=False).
+    """
+    def __init__(self, head_dim: int, max_seq_len: int = 5000, theta: float = 10000.0):
+        super().__init__()
+        assert head_dim % 2 == 0, "RoPE requires an even head dimension"
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len = max_seq_len
+        self._cos_cached: torch.Tensor | None = None
+        self._sin_cached: torch.Tensor | None = None
+        self._cached_len = 0
+
+    def _build_cache(self, seq_len: int, device: torch.device):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq.to(device))   # (T, head_dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1)             # (T, head_dim)
+        self._cos_cached = emb.cos()[None, None, :, :]      # (1, 1, T, head_dim)
+        self._sin_cached = emb.sin()[None, None, :, :]
+        self._cached_len = seq_len
+
+    def forward(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if (self._cos_cached is None or seq_len > self._cached_len
+                or self._cos_cached.device != device):
+            self._build_cache(max(seq_len, self.max_seq_len), device)
+        return self._cos_cached[:, :, :seq_len, :], self._sin_cached[:, :, :seq_len, :]

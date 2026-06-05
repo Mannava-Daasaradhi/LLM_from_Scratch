@@ -3,3 +3,4 @@ torch
 numpy
 pytest
 PyYAML
+-e ../miniflow

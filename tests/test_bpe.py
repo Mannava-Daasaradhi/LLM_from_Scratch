@@ -96,21 +96,21 @@ def test_merges_applied_in_order():
     tok.merges = [('a', 'b'), ('b', 'c')]
     tok._trained = True
     
-    # Word "abc" prepends 'Ġ', becoming ('Ġ', 'a', 'b', 'c').
+    # A leading space byte-encodes to 'Ġ', so " abc" becomes ('Ġ', 'a', 'b', 'c').
     # Applying ('a', 'b') first gives ('Ġ', 'ab', 'c') = [4, 8, 7].
     # If ('b', 'c') were greedily applied first, we'd get ('Ġ', 'a', 'bc') = [4, 5, 9].
-    ids = tok.encode("abc", add_special_tokens=False)
-    
+    ids = tok.encode(" abc", add_special_tokens=False)
+
     assert ids == [4, 8, 7]
 
 def test_word_boundary_marker():
     tok = BPETokenizer()
     text = "hello world"
     tok.train(text, vocab_size=20)
-    
-    # Encode just the word 'world'
-    ids = tok.encode("world", add_special_tokens=False)
-    
-    # The first token ID of the word should correspond to a token string starting with 'Ġ'
+
+    # A leading space byte-encodes to 'Ġ' (GPT-2 convention), marking a word boundary.
+    ids = tok.encode(" world", add_special_tokens=False)
+
+    # The first token of a space-preceded word should start with the 'Ġ' marker.
     first_token_string = tok.id_to_token[ids[0]]
     assert first_token_string.startswith('Ġ')

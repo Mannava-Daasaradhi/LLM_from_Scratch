@@ -92,23 +92,33 @@ def test_generate_respects_temperature(model, dummy_config):
     # The sequences should diverge
     assert not torch.equal(out_cold, out_hot)
 
+def test_generate_kv_cache_matches_uncached(model):
+    # KV-cached generation must produce identical output to the full-recompute path.
+    # Greedy (temperature=0) is deterministic, so the two must match exactly.
+    model.eval()
+    prompt = torch.tensor([[2, 50, 51, 52, 53]])
+    out_cache = model.generate(prompt, max_new_tokens=25, temperature=0.0, use_cache=True)
+    out_nocache = model.generate(prompt, max_new_tokens=25, temperature=0.0, use_cache=False)
+    assert torch.equal(out_cache, out_nocache)
+
+
 def test_parameter_count(model, dummy_config):
-    # Manual calculation based on the architecture:
+    # Manual calculation for the modern architecture (RMSNorm + RoPE + SwiGLU, no biases):
     # 1. Embeddings: vocab_size * d_model = 1000 * 64 = 64,000
-    # 2. Sinusoidal PE: 0 learned params
+    # 2. RoPE: 0 learned params (rotary, applied inside attention)
     # 3. Transformer Blocks (x2):
-    #    - LayerNorms (x2): (64 weight + 64 bias) * 2 = 256
-    #    - Attention: QKV (64 * 192), Out (64 * 64) = 12,288 + 4,096 = 16,384
-    #    - FFN: Linear1 (64 * 256 + 256 bias), Linear2 (256 * 64 + 64 bias) = 16,640 + 16,448 = 33,088
-    #    Block Total: 256 + 16,384 + 33,088 = 49,728
-    #    For 2 blocks: 49,728 * 2 = 99,456
-    # 4. Final LayerNorm: 64 weight + 64 bias = 128
-    # 5. Output Head: 64 * 1000 = 64,000 (Wait, this is TIED to the embedding layer!)
-    
-    # Total distinct parameters = 64,000 + 99,456 + 128 = 163,584
-    expected_params = 163584
+    #    - RMSNorms (x2): 64 + 64 = 128 (weight only, no bias)
+    #    - Attention: QKV (64 * 192), Out (64 * 64) = 12,288 + 4,096 = 16,384 (no bias)
+    #    - SwiGLU FFN: w1 (64*256), w3 (64*256), w2 (256*64) = 16,384*3 = 49,152 (no bias)
+    #    Block Total: 128 + 16,384 + 49,152 = 65,664
+    #    For 2 blocks: 65,664 * 2 = 131,328
+    # 4. Final RMSNorm: 64 (weight only)
+    # 5. Output Head: 64 * 1000 = 64,000 — TIED to the embedding layer, not counted again
+    #
+    # Total distinct parameters = 64,000 + 131,328 + 64 = 195,392
+    expected_params = 195392
     actual_params = model.get_num_params()
-    
+
     assert actual_params == expected_params, f"Expected {expected_params} params, got {actual_params}"
 
 def test_weight_tying(model):

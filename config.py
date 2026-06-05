@@ -10,6 +10,7 @@ class ModelConfig:
     d_ff: int
     max_seq_len: int
     dropout: float
+    rope_theta: float = 10000.0   # RoPE base frequency
 
 @dataclass
 class TrainingConfig:
@@ -25,6 +26,12 @@ class TrainingConfig:
     eval_steps: int
     checkpoint_dir: str
     log_interval: int
+    # Optional knobs (defaults keep older configs loading)
+    label_smoothing: float = 0.0
+    early_stopping_patience: int = 999999
+    grad_accum_steps: int = 1
+    use_amp: bool = True
+    compile: bool = False
 
 @dataclass
 class DataConfig:

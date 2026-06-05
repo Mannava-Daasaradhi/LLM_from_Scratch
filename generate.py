@@ -6,23 +6,14 @@ python generate.py \
   --temperature 0.8 \
   --top_p 0.9
 """
-import torch, argparse
+import argparse
+from types import SimpleNamespace
+
+import torch
+
 from tokenizer.bpe import BPETokenizer
 from model.transformer import GPT
-from config import load_config
 
-class ConfigNode:
-    """Helper class to access dict keys via dot notation"""
-    def __init__(self, d):
-        for k, v in d.items():
-            setattr(self, k, ConfigNode(v) if isinstance(v, dict) else v)
-            
-    # Add these two methods so it behaves like a dictionary too!
-    def __getitem__(self, key):
-        return getattr(self, key)
-        
-    def keys(self):
-        return self.__dict__.keys()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -34,24 +25,36 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9)
     args = parser.parse_args()
 
-    # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    config_dict = ckpt["config"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    from dataclasses import dataclass
-    @dataclass
-    class ModelConfig:
-        vocab_size: int; d_model: int; n_heads: int; n_layers: int
-        d_ff: int; max_seq_len: int; dropout: float
+    # Load checkpoint (config is stored as a plain dict)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = ckpt["config"]
 
-    model_cfg = ModelConfig(**config_dict['model'])
-    tokenizer = BPETokenizer.load(config_dict['data']['tokenizer_path'])
+    # Build the model config from the stored dict. SimpleNamespace gives attribute
+    # access (config.d_model, config.rope_theta, ...) without caring which optional
+    # fields are present, so new keys like rope_theta just work.
+    model_cfg = SimpleNamespace(**config["model"])
+    tokenizer = BPETokenizer.load(config["data"]["tokenizer_path"])
+
     model = GPT(model_cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    # Strip any torch.compile '_orig_mod.' prefix that may remain.
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
+    model.load_state_dict(state)
+    model.to(device).eval()
+
+    meta = []
+    if "step" in ckpt:
+        meta.append(f"step {ckpt['step']}")
+    if "val_loss" in ckpt:
+        meta.append(f"val_loss {ckpt['val_loss']:.4f}")
+    if "val_accuracy" in ckpt:
+        meta.append(f"acc {ckpt['val_accuracy'] * 100:.2f}%")
+    if meta:
+        print(f"[checkpoint: {', '.join(meta)}]")
 
     # Encode prompt
-    input_ids = torch.tensor([tokenizer.encode(args.prompt)]).long()
+    input_ids = torch.tensor([tokenizer.encode(args.prompt)], dtype=torch.long, device=device)
 
     # Generate
     output_ids = model.generate(
@@ -62,11 +65,11 @@ def main():
         top_p=args.top_p,
     )
 
-    # Decode and print (only the new tokens)
     new_tokens = output_ids[0, input_ids.shape[1]:].tolist()
     generated_text = tokenizer.decode(new_tokens)
     print(f"\n=== PROMPT ===\n{args.prompt}")
     print(f"\n=== GENERATED ===\n{generated_text}")
+
 
 if __name__ == "__main__":
     main()
